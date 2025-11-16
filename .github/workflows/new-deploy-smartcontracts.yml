@@ -1,0 +1,90 @@
+name: Deploy Smart Contracts
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '22'
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.NEW_EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.NEW_EC2_IP }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to EC2
+        run: |
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.NEW_EC2_IP }} << 'EOF'
+            set -e
+
+            DEPLOY_DIR="/home/ubuntu/deedlink-deployments"
+            REPO_URL="https://github.com/DeedLink/smartcontractsv3.0.git"
+
+            # Ensure PATH includes Foundry binaries
+            export PATH="$HOME/.foundry/bin:$PATH"
+            echo "✅ PATH: $PATH"
+
+            # Ensure Anvil is installed
+            if ! command -v anvil &> /dev/null; then
+              echo "⚙️ Installing Foundry (includes Anvil)..."
+              curl -L https://foundry.paradigm.xyz | bash
+              source ~/.bashrc
+              foundryup
+            fi
+
+            mkdir -p "$DEPLOY_DIR"
+            cd "$DEPLOY_DIR"
+
+            if [ -d "smartcontracts/.git" ]; then
+              cd smartcontracts
+              git fetch origin main
+              git reset --hard origin/main
+            else
+              rm -rf smartcontracts
+              git clone "$REPO_URL" smartcontracts
+              cd smartcontracts
+            fi
+
+            cd ~
+            > anvil.log
+            rm -f anvil-state.json || true
+            pkill anvil || true
+
+            echo "🚀 Starting Anvil..."
+            nohup "$HOME/.foundry/bin/anvil" \
+              --host 0.0.0.0 \
+              --port 8545 \
+              --chain-id 13337 \
+              > anvil.log 2>&1 &
+
+            echo "⏳ Waiting for Anvil to start..."
+            for i in {1..45}; do
+              if nc -z 127.0.0.1 8545; then
+                echo "✅ Anvil is running!"
+                break
+              fi
+              sleep 1
+            done
+
+            if ! nc -z 127.0.0.1 8545; then
+              echo "❌ Anvil did not start in time. Printing logs..."
+              cat anvil.log
+              exit 1
+            fi
+
+            cd "$DEPLOY_DIR/smartcontracts"
+
+            yarn
+            yarn deploy:anvil
+          EOF
