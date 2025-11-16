@@ -66,6 +66,7 @@ jobs:
               --host 0.0.0.0 \
               --port 8545 \
               --chain-id 13337 \
+              --accounts 20 \
               > anvil.log 2>&1 &
 
             echo "⏳ Waiting for Anvil to start..."
