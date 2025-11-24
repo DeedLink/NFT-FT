@@ -107,7 +107,7 @@ contract Marketplace is ReentrancyGuard {
         require(amount > 0 && amount <= listing.amount, "Invalid amount");
         require(msg.sender != listing.seller, "Cannot buy own tokens");
 
-        uint256 totalPrice = (listing.price * amount) / 1e18;
+        uint256 totalPrice = listing.price * amount;
         require(msg.value == totalPrice, "Wrong price");
 
         IERC20(listing.tokenAddress).transferFrom(listing.seller, msg.sender, amount);

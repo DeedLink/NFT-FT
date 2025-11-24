@@ -20,15 +20,27 @@ contract LastWillRegistry is Ownable, ReentrancyGuard {
         WitnessStatus witness2Status;
     }
 
+    struct DeathVerification {
+        bool isVerified;
+        uint256 verifiedAt;
+        address verifiedBy;
+        string deathCertificateHash;
+        uint256 waitingPeriodEnd;
+    }
+
     enum WitnessStatus {
         PENDING,
         SIGNED,
         REJECTED
     }
 
+    uint256 public constant WAITING_PERIOD_DAYS = 30;
+    uint256 public constant WAITING_PERIOD_SECONDS = WAITING_PERIOD_DAYS * 24 * 60 * 60;
+
     mapping(uint256 => LastWill) public wills;
     mapping(uint256 => address[]) public willWitnesses;
     mapping(address => bool) public authorizedExecutors;
+    mapping(uint256 => DeathVerification) public deathVerifications;
 
     event WillCreated(
         uint256 indexed tokenId,
@@ -65,6 +77,14 @@ contract LastWillRegistry is Ownable, ReentrancyGuard {
     );
 
     event ExecutorAuthorized(address indexed executor, bool status);
+    
+    event DeathVerified(
+        uint256 indexed tokenId,
+        address indexed owner,
+        address indexed verifiedBy,
+        string deathCertificateHash,
+        uint256 waitingPeriodEnd
+    );
 
     IPropertyNFT public propertyNFT;
 
@@ -80,6 +100,12 @@ contract LastWillRegistry is Ownable, ReentrancyGuard {
 
     modifier onlyAuthorizedExecutor() {
         require(authorizedExecutors[msg.sender] || msg.sender == owner(), "Not authorized executor");
+        _;
+    }
+
+    modifier onlyNotary() {
+        bytes32 NOTARY_ROLE = keccak256("NOTARY_ROLE");
+        require(propertyNFT.hasRole(NOTARY_ROLE, msg.sender), "Only notary can perform this action");
         _;
     }
 
@@ -133,6 +159,30 @@ contract LastWillRegistry is Ownable, ReentrancyGuard {
         emit WillWitnessed(tokenId, msg.sender, approve);
     }
 
+    function verifyOwnerDeath(
+        uint256 tokenId,
+        string memory deathCertificateHash
+    ) external onlyNotary {
+        require(wills[tokenId].isActive, "No active will for this property");
+        require(!deathVerifications[tokenId].isVerified, "Death already verified");
+        require(bytes(deathCertificateHash).length > 0, "Death certificate hash required");
+        
+        address owner = propertyNFT.ownerOf(tokenId);
+        require(owner != address(0), "Invalid owner");
+        
+        uint256 waitingPeriodEnd = block.timestamp + WAITING_PERIOD_SECONDS;
+        
+        deathVerifications[tokenId] = DeathVerification({
+            isVerified: true,
+            verifiedAt: block.timestamp,
+            verifiedBy: msg.sender,
+            deathCertificateHash: deathCertificateHash,
+            waitingPeriodEnd: waitingPeriodEnd
+        });
+
+        emit DeathVerified(tokenId, owner, msg.sender, deathCertificateHash, waitingPeriodEnd);
+    }
+
     function executeWill(uint256 tokenId) external nonReentrant onlyAuthorizedExecutor {
         LastWill storage will = wills[tokenId];
         require(will.isActive, "No active will for this property");
@@ -143,7 +193,22 @@ contract LastWillRegistry is Ownable, ReentrancyGuard {
             "Will not fully witnessed"
         );
 
+        DeathVerification memory deathVerification = deathVerifications[tokenId];
+        if (deathVerification.isVerified) {
+            require(
+                block.timestamp >= deathVerification.waitingPeriodEnd,
+                "Waiting period not yet completed"
+            );
+        }
+
         address currentOwner = propertyNFT.ownerOf(tokenId);
+        
+        if (deathVerification.isVerified) {
+            require(
+                currentOwner == propertyNFT.ownerOf(tokenId),
+                "Owner changed after death verification"
+            );
+        }
         
         will.isExecuted = true;
         will.isActive = false;
@@ -158,6 +223,10 @@ contract LastWillRegistry is Ownable, ReentrancyGuard {
         LastWill storage will = wills[tokenId];
         require(will.isActive, "No active will for this property");
         require(!will.isExecuted, "Cannot revoke executed will");
+        require(
+            !deathVerifications[tokenId].isVerified,
+            "Cannot revoke will after owner death verification"
+        );
 
         will.isActive = false;
 
@@ -171,6 +240,10 @@ contract LastWillRegistry is Ownable, ReentrancyGuard {
         LastWill storage will = wills[tokenId];
         require(will.isActive, "No active will for this property");
         require(!will.isExecuted, "Cannot update executed will");
+        require(
+            !deathVerifications[tokenId].isVerified,
+            "Cannot update beneficiary after owner death verification"
+        );
         require(newBeneficiary != address(0), "Invalid beneficiary");
         require(newBeneficiary != msg.sender, "Cannot be your own beneficiary");
 
@@ -218,13 +291,43 @@ contract LastWillRegistry is Ownable, ReentrancyGuard {
 
     function isWillReadyForExecution(uint256 tokenId) external view returns (bool) {
         LastWill memory will = wills[tokenId];
-        return will.isActive && 
-               !will.isExecuted && 
-               will.witness1Status == WitnessStatus.SIGNED && 
-               will.witness2Status == WitnessStatus.SIGNED;
+        if (!will.isActive || will.isExecuted) return false;
+        if (will.witness1Status != WitnessStatus.SIGNED || will.witness2Status != WitnessStatus.SIGNED) {
+            return false;
+        }
+        
+        DeathVerification memory deathVerification = deathVerifications[tokenId];
+        if (deathVerification.isVerified) {
+            return block.timestamp >= deathVerification.waitingPeriodEnd;
+        }
+        
+        return true;
     }
 
     function hasActiveWill(uint256 tokenId) external view returns (bool) {
         return wills[tokenId].isActive && !wills[tokenId].isExecuted;
+    }
+
+    function getDeathVerification(uint256 tokenId) external view returns (
+        bool isVerified,
+        uint256 verifiedAt,
+        address verifiedBy,
+        string memory deathCertificateHash,
+        uint256 waitingPeriodEnd,
+        bool canExecute
+    ) {
+        DeathVerification memory dv = deathVerifications[tokenId];
+        return (
+            dv.isVerified,
+            dv.verifiedAt,
+            dv.verifiedBy,
+            dv.deathCertificateHash,
+            dv.waitingPeriodEnd,
+            dv.isVerified && block.timestamp >= dv.waitingPeriodEnd
+        );
+    }
+
+    function isOwnerDeceased(uint256 tokenId) external view returns (bool) {
+        return deathVerifications[tokenId].isVerified;
     }
 }

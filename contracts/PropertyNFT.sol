@@ -149,33 +149,79 @@ contract PropertyNFT is ERC721, Ownable, AccessControl {
 
     function setRent(uint256 tokenId, uint256 amount, uint256 period, address receiver) external {
         require(ownerOf(tokenId) == msg.sender, "Only owner can set rent");
+        require(receiver != address(0), "Invalid receiver address");
+        require(amount > 0, "Rent amount must be greater than 0");
+        require(period > 0, "Rent period must be greater than 0");
         rentInfo[tokenId] = RentInfo(amount, period, block.timestamp, receiver);
     }
 
-    function payRent(uint256 tokenId) external payable onlyOwnerOrActiveAgent(tokenId, PoARights.PAY_RENT) {
+    function payRent(uint256 tokenId) external payable {
         RentInfo storage rent = rentInfo[tokenId];
         require(rent.amount > 0, "Rent not set");
         require(msg.value == rent.amount, "Incorrect amount");
         require(block.timestamp >= rent.lastPaid + rent.period, "Payment not due yet");
+        
+        bool isReceiver = msg.sender == rent.receiver;
+        bool isOwner = ownerOf(tokenId) == msg.sender;
+        bool hasPoA = _isAuthorized(tokenId, poa[tokenId][msg.sender][PoARights.PAY_RENT]);
+        require(isReceiver || isOwner || hasPoA, "Not authorized to pay rent");
 
         rent.lastPaid = block.timestamp;
         payable(rent.receiver).transfer(msg.value);
         emit RentPaid(tokenId, msg.sender, msg.value, block.timestamp);
     }
 
+    function endRent(uint256 tokenId) external {
+        require(ownerOf(tokenId) == msg.sender, "Only owner can end rent");
+        RentInfo storage rent = rentInfo[tokenId];
+        require(rent.amount > 0, "Rent not set");
+        rent.amount = 0;
+        rent.period = 0;
+        rent.receiver = address(0);
+    }
+
     function isRentActive(uint256 tokenId) public view returns (bool) {
         RentInfo memory rent = rentInfo[tokenId];
+        if (rent.amount == 0) return false;
         return block.timestamp < rent.lastPaid + rent.period;
     }
+
+    event RentReceiverUpdated(uint256 indexed tokenId, address indexed oldReceiver, address indexed newReceiver);
+    event RentEndedOnTransfer(uint256 indexed tokenId, address indexed previousOwner, address indexed newOwner);
 
     function _update(address to, uint256 tokenId, address auth) internal virtual override returns (address) {
         address from = _ownerOf(tokenId);
         
         if (from != address(0)) {
             require(isFullySigned(tokenId), "Property must be fully signed before transfer");
+            
+            RentInfo storage rent = rentInfo[tokenId];
+            if (rent.amount > 0 && rent.receiver != address(0)) {
+                address oldReceiver = rent.receiver;
+                
+                if (to == oldReceiver) {
+                    rent.receiver = address(0);
+                    rent.amount = 0;
+                    rent.period = 0;
+                    emit RentEndedOnTransfer(tokenId, from, to);
+                } else {
+                    rent.receiver = to;
+                    emit RentReceiverUpdated(tokenId, oldReceiver, to);
+                }
+            }
         }
         
         return super._update(to, tokenId, auth);
+    }
+    
+    function updateRentReceiver(uint256 tokenId, address newReceiver) external {
+        require(ownerOf(tokenId) == msg.sender, "Only owner can update rent receiver");
+        RentInfo storage rent = rentInfo[tokenId];
+        require(rent.amount > 0, "Rent not set");
+        require(newReceiver != address(0), "Invalid receiver address");
+        address oldReceiver = rent.receiver;
+        rent.receiver = newReceiver;
+        emit RentReceiverUpdated(tokenId, oldReceiver, newReceiver);
     }
 
     function supportsInterface(bytes4 interfaceId)
